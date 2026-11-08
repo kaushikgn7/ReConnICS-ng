@@ -1,0 +1,114 @@
+package com.advisory;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public final class AdvisoryCli {
+    private static final String USAGE = """
+            usage: java -jar target/reconnics-ng.jar <command> [options]
+
+            Online side (has internet):
+              keygen      --keys DIR                       Ed25519 keypair for signing the index
+              build-index [--feed PATH|URL] [--kev PATH|URL] [--cache DIR] [--out FILE]
+                          [--limit N] [--offline] [--sign-key FILE]
+                          mirror CSAF OT advisories into --cache, build index (--offline: cache only)
+
+            Offline side (air-gapped analyst laptop):
+              verify --index FILE --pubkey FILE                 exit 0 only if the signature is valid
+              match --index FILE (--pubkey FILE | --insecure-no-verify) [--format json|csv|html] [--out FILE] ASSETS.json
+              serve --index FILE (--pubkey FILE | --insecure-no-verify) [--port 8088] [--data data/site]
+                    [--allow-origin ORIGIN[,ORIGIN...]]
+                          local web UI + ingest API on 127.0.0.1; captures, edits and change log kept under --data
+              inventory --in OBSERVATIONS.json --out DIR [--oui oui.csv] [--index FILE (--pubkey FILE | --insecure-no-verify)]
+              An index is refused unless its signature verifies (--pubkey); --insecure-no-verify accepts it unverified.
+            """;
+
+    public static final java.util.Set<String> COMMANDS = java.util.Set.of("keygen", "build-index", "match", "serve", "inventory", "verify");
+
+    public static void main(String[] argv) throws Exception {
+        if (argv.length == 0) { System.err.print(USAGE); System.exit(2); }
+        if (argv[0].equals("inventory")) System.exit(Inventory.run(java.util.Arrays.copyOfRange(argv, 1, argv.length), System.err));
+        Map<String, String> o = new HashMap<>();
+        List<String> pos = new ArrayList<>();
+        for (int i = 1; i < argv.length; i++) {
+            if (!argv[i].startsWith("--")) pos.add(argv[i]);
+            else if (argv[i].equals("--offline")) o.put("offline", "1");
+            else if (argv[i].equals("--insecure-no-verify")) o.put("insecure-no-verify", "1");
+            else if (argv[i].equals("--allow-origin") && i + 1 < argv.length) o.merge("allow-origin", argv[++i], (a, b) -> a + "," + b);   // repeatable
+            else if (i + 1 < argv.length) o.put(argv[i].substring(2), argv[++i]);
+            else die("missing value for " + argv[i]);
+        }
+        switch (argv[0]) {
+            case "keygen" -> {
+                Path dir = Path.of(o.getOrDefault("keys", "keys"));
+                AdvisoryIndex.keygen(dir);
+                System.err.println("wrote " + dir.resolve("index-signing.key") + " (keep on online side) and .pub (copy to offline side)");
+            }
+            case "build-index" -> {
+                Path cache = Path.of(o.getOrDefault("cache", "data/csaf"));
+                Path out = Path.of(o.getOrDefault("out", "data/index.json"));
+                String feed = o.getOrDefault("feed", IndexBuilder.CSAF_FEED);
+                if (!o.containsKey("offline")) IndexBuilder.sync(feed, cache, Integer.parseInt(o.getOrDefault("limit", "0")));
+                var idx = IndexBuilder.build(cache, o.getOrDefault("kev", IndexBuilder.KEV_FEED), feed);
+                if (out.getParent() != null) Files.createDirectories(out.getParent());
+                Files.writeString(out, idx.toJson());
+                if (o.containsKey("sign-key")) AdvisoryIndex.sign(out, Path.of(o.get("sign-key")));
+                System.err.printf("index: %s advisories, %d rows -> %s%n", Json.write(idx.meta.get("advisories")), idx.rows.size(), out);
+            }
+            case "match" -> {
+                if (pos.size() != 1) die("match needs exactly one ASSETS.json");
+                var idx = loadIndex(o);
+                Object doc = Json.parse(AdvisoryIndex.utf8(AdvisoryIndex.readCapped(Path.of(pos.get(0)), AdvisoryIndex.MAX_ASSETS_BYTES)));
+                List<Asset> assets = new ArrayList<>();
+                for (Object a : doc instanceof List ? Json.arr(doc) : Json.arr(Json.obj(doc).get("assets"))) assets.add(Asset.from(a));
+                var r = Report.run(new AdvisoryMatcher(idx), assets);
+                String text = switch (o.getOrDefault("format", "json")) {
+                    case "csv" -> Report.csv(r);
+                    case "html" -> Report.html(r, idx.meta, idx.verified);
+                    case "json" -> Json.write(Report.json(r, idx.meta, idx.verified));
+                    default -> { die("unknown --format"); yield ""; }
+                };
+                if (o.containsKey("out")) Files.writeString(Path.of(o.get("out")), text);
+                else System.out.println(text);
+            }
+            case "serve" -> {
+                int port = Integer.parseInt(o.getOrDefault("port", "8088"));
+                var site = new Site(Path.of(o.getOrDefault("data", "data/site")), loadIndex(o), Path.of(o.get("index")),
+                        o.containsKey("pubkey") ? Path.of(o.get("pubkey")) : null, o.containsKey("insecure-no-verify"));
+                var server = new IngestServer(site);
+                try { if (o.containsKey("allow-origin")) server.allowOrigins(List.of(o.get("allow-origin").split(","))); }
+                catch (IllegalArgumentException e) { die(e.getMessage()); }
+                server.start(port);
+                System.err.println("UI on http://127.0.0.1:" + port + "/  (ingest API under /api/v1/, site data in " + site.dir + ")");
+            }
+            case "verify" -> {
+                if (!o.containsKey("pubkey")) die("verify needs --pubkey");
+                try {
+                    var idx = loadIndex(o);
+                    System.err.printf("verify: OK, generated %s, %d rows%n", idx.meta.get("generated"), idx.rows.size());
+                } catch (Exception e) {
+                    System.err.println("verify: " + e.getMessage());
+                    System.exit(1);
+                }
+            }
+            default -> { System.err.print(USAGE); System.exit(2); }
+        }
+    }
+
+    private static AdvisoryIndex loadIndex(Map<String, String> o) throws Exception {
+        if (!o.containsKey("index")) die("--index required");
+        if (!o.containsKey("pubkey") && !o.containsKey("insecure-no-verify"))
+            die("refusing an unverified index: pass --pubkey FILE, or --insecure-no-verify to accept it unsigned");
+        var idx = AdvisoryIndex.load(Path.of(o.get("index")), o.containsKey("pubkey") ? Path.of(o.get("pubkey")) : null,
+                o.containsKey("insecure-no-verify"));
+        String stale = AdvisoryIndex.staleness(idx.meta, java.time.Instant.now());
+        if (stale != null) System.err.println("WARNING: " + stale);
+        return idx;
+    }
+
+    private static void die(String msg) { System.err.println(msg); System.exit(2); }
+}

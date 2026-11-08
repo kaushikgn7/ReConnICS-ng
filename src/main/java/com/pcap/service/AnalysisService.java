@@ -1,0 +1,617 @@
+package com.pcap.service;
+
+import com.pcap.inventory.ConversationTracker;
+import com.pcap.inventory.DeviceAggregator;
+import com.pcap.inventory.NetworkObserver;
+import com.pcap.model.DetectionBasis;
+import com.pcap.model.DeviceObservation;
+import com.pcap.output.IngestJsonWriter;
+import com.pcap.output.IngestModels;
+import com.pcap.capture.PacketParser;
+import com.pcap.capture.PacketRecord;
+import com.pcap.capture.ParsedPacket;
+import com.pcap.capture.ParseStatus;
+import com.pcap.capture.PcapException;
+import com.pcap.capture.PcapReader;
+import com.pcap.capture.TcpReassembler;
+import com.pcap.protocol.ProtocolDetector;
+import com.pcap.zeek.ZeekData;
+import com.pcap.zeek.ZeekException;
+import com.pcap.zeek.ZeekLogReader;
+import com.pcap.zeek.ZeekRunner;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.time.Clock;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+public final class AnalysisService {
+    private static final Logger LOG = Logger.getLogger(AnalysisService.class.getName());
+
+    private static final int MAX_HELD = 20_000;
+
+    private final PacketParser packetParser = new PacketParser();
+    private final ProtocolDetector detector = new ProtocolDetector();
+    private final IngestJsonWriter jsonWriter = new IngestJsonWriter();
+    private final Clock clock;
+    private final String path;
+    private final com.pcap.tools.Env toolEnv;
+    private final AtomicBoolean cancelled = new AtomicBoolean(false);
+    private Progress progress = Progress.NONE;
+    private boolean deferLate;
+    // what the status line (Progress.status) is built from; reset by each analyze()
+    private final java.util.concurrent.atomic.AtomicLong frames = new java.util.concurrent.atomic.AtomicLong();
+    private volatile boolean nativeDone;
+    private volatile int zeekPct = -1;
+    private volatile String zeekState = "off";
+    private final java.util.Set<String> pendingTools = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    public AnalysisService() {
+        this(Clock.systemUTC());
+    }
+
+    public AnalysisService(Clock clock) {
+        this.clock = clock;
+        this.path = System.getenv("PATH");
+        this.toolEnv = com.pcap.tools.Env.system();
+    }
+
+    /**
+     * {@code path} is where Zeek and the other tools are looked for; tests pass a temp directory instead of the real PATH, and then
+     * no data files of this machine are consulted either.
+     */
+    public AnalysisService(Clock clock, String path) {
+        this.clock = clock;
+        this.path = path;
+        this.toolEnv = new com.pcap.tools.Env(path, "docker", null, List.of());
+    }
+
+    /**
+     * The console's setting: do not wait for Suricata. When everything else is done and it is still running, the result carries
+     * {@link AnalysisResult#late} and the caller adds its alerts when it finishes. Off (the CLI): every tool is waited for.
+     */
+    public AnalysisService deferLate(boolean on) {
+        this.deferLate = on;
+        return this;
+    }
+
+    public AnalysisService progress(Progress p) {
+        this.progress = p == null ? Progress.NONE : p;
+        return this;
+    }
+
+    public void cancel() {
+        cancelled.set(true);
+    }
+
+    public IngestJsonWriter jsonWriter() {
+        return jsonWriter;
+    }
+
+    public AnalysisResult analyze(Path capturePath, boolean verbose) throws IOException, PcapException {
+        return analyze(capturePath, verbose, AnalysisOptions.DEFAULT);
+    }
+
+    public AnalysisResult analyze(Path capturePath, boolean verbose, AnalysisOptions options) throws IOException, PcapException {
+        cancelled.set(false);
+        List<String> notes = new ArrayList<>();
+        // Decide about Zeek before the long native pass, so a missing engine fails (or falls back) at once. Zeek then runs
+        // beside the native pass: it only reads the capture file, and the two are merged afterwards.
+        frames.set(0); nativeDone = false; zeekPct = -1; zeekState = "off"; pendingTools.clear();
+        long started = System.nanoTime();
+        ZeekRunner runner = new ZeekRunner(path, "docker", options.zeekTimeout()).onPercent(pct -> {
+            int last = zeekPct;
+            zeekPct = pct;
+            if (pct / 10 > Math.max(last, 0) / 10) progress.log("Zeek + ICSNPP has read " + pct + "% of the capture");
+        });
+        ZeekRunner.Engine zeekEngine = null;
+        boolean useZeek = options.engine() != AnalysisOptions.Engine.NATIVE;
+        if (useZeek && options.zeekLogs() == null) {
+            zeekEngine = runner.detect().orElse(null);
+            if (zeekEngine == null) {
+                if (options.engine() == AnalysisOptions.Engine.ZEEK) {
+                    throw new ZeekException(ZeekException.Kind.ENGINE, "--engine zeek: neither 'zeek' on PATH nor the "
+                            + ZeekRunner.IMAGE + " Docker image was found (see README, section Zeek engine). "
+                            + "Use --engine auto to fall back to the native decoders, or --zeek-logs DIR for logs you already have");
+                }
+                progress.log("Zeek not found: native decoders only");
+                notes.add("--engine auto: Zeek not found (no 'zeek' on PATH, no " + ZeekRunner.IMAGE + " image); using the native decoders only");
+                useZeek = false;
+            }
+        }
+        CompletableFuture<ZeekRunner.Run> zeekRun = null;
+        if (useZeek && options.zeekLogs() == null) {
+            final ZeekRunner.Engine eng = zeekEngine;
+            progress.log("Zeek + ICSNPP started (" + eng.describe() + ")");
+            zeekState = "running";
+            zeekRun = CompletableFuture.supplyAsync(() -> {
+                long t0 = System.nanoTime();
+                try {
+                    var r = runner.run(eng, capturePath);
+                    zeekState = "done";
+                    progress.log("Zeek + ICSNPP finished its run in " + (System.nanoTime() - t0) / 1_000_000_000 + " s");
+                    return r;
+                } catch (ZeekException e) {
+                    throw new CompletionException(e);
+                }
+            });
+        }
+        if (options.toolsEnabled()) com.pcap.tools.ToolPipeline.ADAPTERS.forEach(a -> pendingTools.add(a.component().id()));
+        List<CompletableFuture<com.pcap.tools.ToolPipeline.Outcome>> toolsRun = options.toolsEnabled()
+                ? com.pcap.tools.ToolPipeline.startEach(toolEnv.withTimeout(options.zeekTimeout()), capturePath, line -> {
+                    progress.log(line);
+                    pendingTools.remove(line.substring(0, Math.max(0, line.indexOf(':'))));
+                }) : null;
+        if (toolsRun != null) progress.log("tshark, Suricata, nDPI and p0f started (the ones installed)");
+        var heartbeat = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> { Thread t = new Thread(r, "reconics-status"); t.setDaemon(true); return t; });
+        heartbeat.scheduleWithFixedDelay(() -> progress.status(statusLine(started)), 0, 2, java.util.concurrent.TimeUnit.SECONDS);
+        try {
+            return analyzeWith(capturePath, verbose, options, notes, useZeek, zeekEngine, zeekRun, runner, toolsRun);
+        } finally {
+            heartbeat.shutdownNow();
+            progress.status("");
+            if (zeekRun != null) {
+                // whatever happened, the temp log directory must not outlive the call
+                zeekRun.thenAccept(r -> ZeekRunner.deleteTree(r.logDir()));
+            }
+        }
+    }
+
+    /** Size of the *.log files Zeek left in {@code dir}: total, count and the largest; empty when there are none. */
+    private static Map<String, Object> logSize(Path dir) {
+        long total = 0, big = 0;
+        int n = 0;
+        String name = "";
+        try (var files = java.nio.file.Files.list(dir)) {
+            for (Path f : (Iterable<Path>) files::iterator) {
+                if (!f.getFileName().toString().endsWith(".log") || !java.nio.file.Files.isRegularFile(f)) continue;
+                long sz = java.nio.file.Files.size(f);
+                total += sz;
+                n++;
+                if (sz > big) { big = sz; name = f.getFileName().toString(); }
+            }
+        } catch (IOException | RuntimeException e) {
+            return Map.of();
+        }
+        return n == 0 ? Map.of() : Map.of("bytes", total, "files", n, "largest", name, "largestBytes", big);
+    }
+
+    private static String human(long b) {
+        return b >= 1L << 30 ? String.format(java.util.Locale.ROOT, "%.1f GB", b / (double) (1L << 30))
+                : b >= 1L << 20 ? String.format(java.util.Locale.ROOT, "%.1f MB", b / (double) (1L << 20)) : Math.max(1, b >> 10) + " KB";
+    }
+
+    /** "Native decoder 820,000 frames · Zeek 42% · waiting on tshark, suricata · 31 s": what each engine is doing right now. */
+    private String statusLine(long startedNanos) {
+        List<String> p = new ArrayList<>();
+        p.add("Native decoder " + String.format(java.util.Locale.ROOT, "%,d", frames.get()) + " frames" + (nativeDone ? " (done)" : ""));
+        if (zeekState.equals("running")) p.add("Zeek " + (zeekPct >= 0 ? zeekPct + "%" : "running"));
+        else if (zeekState.equals("done")) p.add("Zeek (done)");
+        if (!pendingTools.isEmpty()) p.add("waiting on " + String.join(", ", new java.util.TreeSet<>(pendingTools)));
+        p.add((System.nanoTime() - startedNanos) / 1_000_000_000 + " s");
+        return String.join(" · ", p);
+    }
+
+    private AnalysisResult analyzeWith(Path capturePath, boolean verbose, AnalysisOptions options, List<String> notes, boolean useZeek,
+                                       ZeekRunner.Engine zeekEngine, CompletableFuture<ZeekRunner.Run> zeekRun, ZeekRunner runner,
+                                       List<CompletableFuture<com.pcap.tools.ToolPipeline.Outcome>> toolsRun)
+            throws IOException, PcapException {
+        NetworkObserver observer = new NetworkObserver();
+        ConversationTracker conversations = new ConversationTracker().observer(observer).scanRule(options.scan());
+        DeviceAggregator aggregator = new DeviceAggregator();
+        TcpReassembler reassembler = new TcpReassembler();
+        Map<String, Long> candidates = new HashMap<>();
+        Map<String, Long> decoded = new HashMap<>();
+        // Modbus seen on a port no industrial protocol uses waits here for nDPI / tshark (ToolPipeline.mayBeMisread)
+        List<DeviceObservation> held = new ArrayList<>();
+        long malformed = 0;
+        long truncated = 0;
+        long fragmented = 0;
+        long unsupported = 0;
+        String captureError = null;
+
+        progress.step(2);
+        try (PcapReader reader = PcapReader.open(capturePath)) {
+            progress.log("Reading " + capturePath.getFileName() + " (" + reader.format() + ", link type " + reader.linkType() + ")");
+            if (verbose) {
+                LOG.info(() -> "Opened " + capturePath + " format=" + reader.format()
+                        + " link=" + reader.linkType());
+            }
+            while (true) {
+                if (cancelled.get()) {
+                    throw new IOException("analysis cancelled");
+                }
+                PacketRecord record;
+                try {
+                    record = reader.readNext();
+                } catch (PcapException e) {
+                    if (reader.framesRead() == 0) {
+                        throw e;
+                    }
+                    // damaged or cut-off tail: keep what the frames read so far established
+                    captureError = e.getMessage();
+                    LOG.warning("capture damaged after frame " + reader.framesRead() + ": " + captureError
+                            + " (results cover the frames before it)");
+                    break;
+                }
+                if (record == null) {
+                    break;
+                }
+                if (reader.framesRead() % 1000 == 0) {
+                    frames.set(reader.framesRead());
+                }
+                if (reader.framesRead() % 100_000 == 0) {
+                    progress.log(reader.framesRead() + " frames decoded");
+                }
+                ParsedPacket parsed;
+                try {
+                    parsed = packetParser.parse(record);
+                } catch (RuntimeException e) {
+                    malformed++;
+                    observer.notParsed("parser exception on a frame (counted, nothing kept)");
+                    if (verbose) {
+                        LOG.log(Level.FINE, "parse error frame " + record.frameNumber(), e);
+                    }
+                    continue;
+                }
+                observer.observe(parsed);
+                switch (parsed.status()) {
+                    case OK -> {
+                        conversations.observe(parsed);
+                        List<DeviceObservation> obs = new ArrayList<>();
+                        try {
+                            for (ParsedPacket unit : reassembler.accept(parsed)) {
+                                obs.addAll(detector.detect(unit));
+                            }
+                        } catch (RuntimeException e) {
+                            // a decoder bug on one hostile packet must not abort the whole analysis
+                            malformed++;
+                            if (verbose) {
+                                LOG.log(Level.FINE, "decode error frame " + parsed.frameNumber(), e);
+                            }
+                            continue;
+                        }
+                        for (DeviceObservation o : obs) {
+                            if (held.size() < MAX_HELD && com.pcap.tools.ToolPipeline.mayBeMisread(o)) {   // ponytail: past the cap they are accepted at once, a capture that is mostly odd-port Modbus has no use for the check
+                                held.add(o);
+                                continue;
+                            }
+                            take(o, candidates, decoded, aggregator);
+                        }
+                    }
+                    case TRUNCATED, MALFORMED -> {
+                        truncated += parsed.status() == ParseStatus.TRUNCATED ? 1 : 0;
+                        malformed += parsed.status() == ParseStatus.MALFORMED ? 1 : 0;
+                        if (parsed.status() == ParseStatus.TRUNCATED) {
+                            // already counted truncated
+                        } else {
+                            // malformed counted
+                        }
+                        if (verbose) {
+                            LOG.fine(() -> "frame " + parsed.frameNumber() + " " + parsed.status()
+                                    + ": " + parsed.detail());
+                        }
+                    }
+                    case FRAGMENTED -> fragmented++;
+                    case UNSUPPORTED -> unsupported++;
+                    case SKIPPED -> {
+                        // intentional skip (non-IPv4 etc.)
+                    }
+                }
+            }
+
+            frames.set(reader.framesRead());
+            nativeDone = true;
+            progress.log(reader.framesRead() + " frames decoded in total (" + (malformed + truncated) + " malformed or truncated)");
+            conversations.mergeInto(detector.flows(), options.icsOnly(), options.keepScans());
+            if (!options.icsOnly()) {
+                observer.addFlows(detector.flows());             // ICMP and group-address conversations; --ics-only asks for decoded protocols only
+            }
+            ZeekData zeek = null;
+            com.pcap.inventory.HostFacts facts = new com.pcap.inventory.HostFacts();   // DHCP and web-server evidence: Zeek's logs, tshark's fields where Zeek has none
+            String zeekVersion = "";
+            String zeekHow = "";
+            Map<String, Object> zeekLogs = Map.of();
+            if (useZeek) {
+                progress.step(3);
+                Path logDir;
+                if (zeekRun != null) {
+                    progress.log("Waiting for Zeek + ICSNPP");
+                    ZeekRunner.Run run;
+                    try {
+                        run = zeekRun.join();
+                    } catch (CompletionException e) {
+                        if (e.getCause() instanceof ZeekException ze) {
+                            throw ze;
+                        }
+                        throw e;
+                    }
+                    logDir = run.logDir();
+                    zeekVersion = run.version();
+                    zeekHow = run.engine().describe();
+                } else {
+                    logDir = options.zeekLogs();
+                    zeekHow = "logs from " + logDir;
+                }
+                zeekLogs = logSize(logDir);
+                if (!zeekLogs.isEmpty()) {
+                    progress.log("Zeek + ICSNPP wrote " + human((long) zeekLogs.get("bytes")) + " of logs in " + zeekLogs.get("files") + " files (largest: "
+                            + zeekLogs.get("largest") + ", " + human((long) zeekLogs.get("largestBytes")) + ")");
+                }
+                progress.log("Reading the Zeek and ICSNPP logs");
+                zeek = new ZeekLogReader(options.icsOnly(), options.keepScans()).read(logDir);
+                progress.log("Zeek logs read: " + zeek.flows().size() + " conversations, " + zeek.observations().size() + " host observations");
+                // Zeek's identity, banners and hosts join the native ones through the same aggregator (by IP and MAC); the
+                // resolver prefers a native decoded value over a Zeek one at equal confidence and keeps both as evidence
+                for (DeviceObservation o : zeek.observations()) {
+                    if (held.size() < MAX_HELD && com.pcap.tools.ToolPipeline.mayBeMisread(o)) {
+                        held.add(o);
+                    } else {
+                        aggregator.accept(o);
+                    }
+                }
+                detector.flows().mergeFrom(zeek.flows());
+                java.util.Set<String> talked = new java.util.HashSet<>();
+                for (var fl : detector.flows().toList(true)) {
+                    talked.add(String.valueOf(fl.get("client")));
+                    talked.add(String.valueOf(fl.get("server")));
+                }
+                com.pcap.zeek.ZeekHostNames hostNames = new com.pcap.zeek.ZeekHostNames();
+                hostNames.read(logDir, talked::contains).forEach(aggregator::accept);
+                facts = hostNames.facts(logDir);   // DHCP host names, unambiguous DNS A answers, for hosts already in the capture
+            }
+
+            // The optional tools beyond Zeek: their conversations, labels and alerts join the flow table the same way Zeek's did
+            progress.step(4);
+            List<com.pcap.tools.ToolPipeline.Outcome> outcomes;
+            CompletableFuture<com.pcap.tools.ToolPipeline.Outcome> lateTool = null;
+            if (toolsRun != null) {
+                progress.log("Waiting for the other tools");
+                var adapters = com.pcap.tools.ToolPipeline.ADAPTERS;
+                var got = new com.pcap.tools.ToolPipeline.Outcome[adapters.size()];
+                for (int i = 0; i < got.length; i++) {
+                    if (!(deferLate && adapters.get(i).component().id().equals("suricata"))) {
+                        got[i] = toolsRun.get(i).join();
+                    }
+                }
+                for (int i = 0; i < got.length; i++) {
+                    if (got[i] != null) {
+                        continue;
+                    }
+                    String id = adapters.get(i).component().id();
+                    if (toolsRun.get(i).isDone()) {
+                        got[i] = toolsRun.get(i).join();
+                    } else {
+                        lateTool = toolsRun.get(i);
+                        got[i] = com.pcap.tools.ToolPipeline.running(id);
+                        pendingTools.remove(id);
+                        progress.log(id + " is still running: the capture is merged without it, its alerts are added when it finishes");
+                    }
+                }
+                outcomes = java.util.Arrays.asList(got);
+            } else {
+                outcomes = com.pcap.tools.ToolPipeline.skipped(options.engine() == AnalysisOptions.Engine.NATIVE
+                        ? "not requested: --engine native uses nothing outside the jar (--tools auto to use them)" : "--tools off");
+            }
+            final var lateF = lateTool;
+            progress.step(5);
+            com.pcap.tools.ToolPipeline.Merged merged = com.pcap.tools.ToolPipeline.mergeFlows(detector.flows(), outcomes, options.icsOnly());
+            merged.observations().forEach(aggregator::accept);
+            for (DeviceObservation o : held) {
+                if (merged.rejects(o)) {
+                    aggregator.accept(com.pcap.tools.ToolPipeline.presenceOnly(o));       // the host stays, the Modbus claim does not
+                } else if (o.detectionBasis().fromZeek()) {
+                    aggregator.accept(o);
+                } else {
+                    take(o, candidates, decoded, aggregator);
+                }
+            }
+            if (!merged.rejectedIcs().isEmpty()) {
+                notes.add(merged.rejectedIcs().size() + " Modbus decode(s) rejected (only exceptions, on a port no ICS protocol uses, and nDPI or tshark name the conversation "
+                        + "another protocol): kept as unknown flows with a note");
+            }
+            outcomes.stream().filter(o -> o.status().id().equals("tshark")).findFirst().ifPresent(o -> {
+                Object n = o.status().produced().get("capinfos") instanceof Map<?, ?> m ? m.get("packets") : null;
+                if (n != null && !n.toString().equals(Long.toString(reader.framesRead()))) {
+                    notes.add("capinfos (Wireshark) counts " + n + " packets, the native reader read " + reader.framesRead() + " frames");
+                }
+            });
+
+            progress.log("Resolving hosts and identities");
+            List<DeviceAggregator.ResolvedAsset> assets = aggregator.resolveAssets();
+            progress.log(assets.size() + " hosts resolved");
+            int conflicts = assets.stream().mapToInt(a -> a.identity().conflictCount()).sum();
+            Instant now = clock.instant();
+
+            AnalysisReport draft = new AnalysisReport(
+                    capturePath,
+                    reader.format(),
+                    reader.linkType(),
+                    reader.framesRead(),
+                    malformed + truncated,
+                    truncated,
+                    fragmented,
+                    unsupported,
+                    Map.copyOf(candidates),
+                    Map.copyOf(decoded),
+                    aggregator.identityFieldCount(),
+                    aggregator.observationCount(),
+                    aggregator.portOnlyCount(),
+                    aggregator.headerValidatedCount(),
+                    aggregator.messageDecodedCount(),
+                    assets,
+                    conflicts,
+                    now,
+                    false,
+                    "pending");
+
+            IngestModels.Document doc = jsonWriter.build(draft);
+            doc.source.put("tcpReassembly", reassembler.stats().toMap());
+            if (captureError != null) {
+                doc.source.put("captureError", captureError);
+            }
+            var flows = detector.flows().toList(options.keepScans() && !options.icsOnly());
+            doc.flows = flows.isEmpty() ? null : flows;
+            progress.step(6);
+            com.pcap.tools.ReferenceData.Loaded ref = options.toolsEnabled() ? com.pcap.tools.ReferenceData.load(toolEnv) : null;
+            com.pcap.inventory.PortHints.useSupplement(ref == null ? null : ref.services());   // Nmap's nmap-services, when installed: names for ports the table lacks
+            com.pcap.inventory.HostClassifier.apply(doc);        // port hints for undecoded flows, roles for hosts no decoder explained
+            observer.apply(doc, detector.flows());
+            for (var o : outcomes) {
+                if ("ran".equals(o.status().state())) {
+                    facts.mergeMissing(o.findings().facts());
+                }
+            }
+            facts.apply(doc);               // every address, group address and MAC the capture showed, as sourced low-confidence facts
+            com.pcap.tools.ToolPipeline.applyAssets(doc, outcomes);   // after every host (including the ones only seen on the wire) is in the document
+            if (options.imageDir() != null && options.toolsEnabled()) {          // like the other tools: not with --engine native, which promises nothing outside the jar
+                progress.log("Extracting images from HTTP bodies");
+                var im = com.pcap.tools.HttpImages.extract(toolEnv.withTimeout(options.zeekTimeout()), capturePath, options.imageDir());
+                if (!im.images().isEmpty()) {
+                    doc.images = im.images().stream().map(com.pcap.tools.HttpImages.Image::toMap).toList();
+                }
+                doc.source.put("images", im.summary());
+            } else if (options.imageDir() != null) {
+                doc.source.put("images", Map.of("tool", "tshark (http bodies)", "state", "not-run", "reason", "tools are off (--engine native or --tools off)"));
+            }
+            // connections that never completed a handshake: edges only with --keep-scans, but the total is worth knowing
+            long scanTotal = Math.max(conversations.scanAttempts(), zeek == null ? 0 : zeek.stats().scanAttempts());
+            if (scanTotal > 0) {
+                doc.source.put("scanAttempts", scanTotal);
+            }
+            doc.source.put("engine", zeek == null ? "native" : "zeek+native");
+            if (zeek != null) {
+                Map<String, Object> z = new java.util.LinkedHashMap<>();
+                z.put("run", zeekHow);
+                if (!zeekVersion.isEmpty()) {
+                    z.put("version", zeekVersion);
+                }
+                z.putAll(zeek.stats().toMap());
+                if (!zeekLogs.isEmpty()) {
+                    z.put("logBytes", zeekLogs.get("bytes"));              // README: log size is worth knowing; modbus_detailed.log is usually the big one
+                    z.put("largestLog", zeekLogs.get("largest") + " (" + human((long) zeekLogs.get("largestBytes")) + ")");
+                }
+                doc.source.put("zeek", z);
+            }
+            if (aggregator.droppedOverCap() > 0) {
+                doc.source.put("observationsDroppedOverAssetCap", aggregator.droppedOverCap());
+            }
+            List<Map<String, Object>> toolList = new ArrayList<>();
+            zeekStatuses(options, zeek, zeekVersion, zeekHow).forEach(t -> toolList.add(t.toMap()));
+            outcomes.forEach(o -> toolList.add(o.status().toMap()));
+            if (ref != null) {
+                ref.statuses().stream().filter(t -> t.id().equals("nmap-services")).forEach(t -> toolList.add(t.toMap()));
+            }
+            if (zeek != null || options.engine() != AnalysisOptions.Engine.NATIVE || options.toolsEnabled()) {
+                doc.source.put("tools", toolList);               // the plain native default stays free of any mention of other tools
+            }
+            AnalysisReport report = new AnalysisReport(
+                    draft.capturePath(),
+                    draft.captureFormat(),
+                    draft.linkType(),
+                    draft.framesProcessed(),
+                    draft.malformedOrSkipped(),
+                    draft.truncatedPackets(),
+                    draft.fragmentedIpv4(),
+                    draft.unsupportedLinkOrL3(),
+                    draft.protocolCandidates(),
+                    draft.protocolDecoded(),
+                    draft.identityFieldsDecoded(),
+                    draft.observations(),
+                    draft.portHeuristicObservations(),
+                    draft.headerValidatedObservations(),
+                    draft.messageDecodedObservations(),
+                    draft.assets(),
+                    draft.unresolvedConflicts(),
+                    Instant.parse(draft.executedAtIso()),
+                    true,
+                    "");
+            Late late = lateF == null ? null : new Late(lateF, o -> {
+                List<com.pcap.tools.ToolPipeline.Outcome> one = List.of(o);
+                com.pcap.tools.ToolPipeline.mergeFlows(detector.flows(), one, options.icsOnly());      // the alerts onto the flow table...
+                com.pcap.tools.ToolPipeline.applyAssets(doc, one);                                     // ...and onto the assets
+                if (doc.flows != null) {                                                               // the document's flows were copied out of the table before the alerts existed
+                    Map<String, Map<String, Object>> byKey = new HashMap<>();
+                    doc.flows.forEach(m -> byKey.put(flowKey(m), m));
+                    for (Map<String, Object> nm : detector.flows().toList(true)) {
+                        Map<String, Object> dm = nm.get("alerts") == null ? null : byKey.get(flowKey(nm));
+                        if (dm != null) {
+                            dm.put("alerts", nm.get("alerts"));
+                        }
+                    }
+                }
+                toolList.replaceAll(m -> o.status().id().equals(m.get("id")) ? o.status().toMap() : m);   // "running" becomes ran / failed
+                return doc;
+            });
+            return new AnalysisResult(report, doc, notes, late);
+        }
+    }
+
+    private static String flowKey(Map<String, Object> m) {
+        return m.get("client") + ">" + m.get("server") + ">" + m.get("protocol") + ">" + m.get("port");
+    }
+
+    private static void take(DeviceObservation o, Map<String, Long> candidates, Map<String, Long> decoded, DeviceAggregator aggregator) {
+        candidates.merge(o.protocol().wireName(), 1L, Long::sum);
+        if (o.detectionBasis() == DetectionBasis.MESSAGE_DECODED) {
+            decoded.merge(o.protocol().wireName(), 1L, Long::sum);
+        }
+        aggregator.accept(o);
+    }
+
+    /** Zeek and ICSNPP lines of {@code source.tools}: Zeek is not an {@code Adapter} (it has its own runner and log reader). */
+    private static List<com.pcap.tools.ToolStatus> zeekStatuses(AnalysisOptions options, ZeekData zeek, String version, String how) {
+        List<com.pcap.tools.ToolStatus> out = new ArrayList<>();
+        if (zeek == null) {
+            boolean off = options.engine() == AnalysisOptions.Engine.NATIVE;
+            String why = off ? "not requested: --engine native" : "Zeek not found (no zeek on PATH, no " + ZeekRunner.IMAGE + " Docker image)";
+            out.add(new com.pcap.tools.ToolStatus("zeek", off ? "skipped" : "not-installed", "", "", why, null));
+            out.add(new com.pcap.tools.ToolStatus("icsnpp", off ? "skipped" : "not-installed", "", "", "needs Zeek", null));
+            return out;
+        }
+        String via = how.startsWith("logs from") ? "existing-logs" : how.startsWith("docker") ? "docker" : "native";
+        Map<String, Object> produced = new java.util.LinkedHashMap<>();
+        produced.put("connections", zeek.stats().connections());
+        out.add(new com.pcap.tools.ToolStatus("zeek", "ran", via, version, how, produced));
+        Map<String, Object> rows = new java.util.LinkedHashMap<>();
+        for (String log : com.pcap.zeek.IcsnppPackages.readLogs()) {
+            long n = zeek.stats().rowsUsed(log);
+            if (n > 0) {
+                rows.put(log, n);
+            }
+        }
+        out.add(new com.pcap.tools.ToolStatus("icsnpp", "ran", via, "", rows.isEmpty()
+                ? "no ICSNPP log rows: the capture has no Modbus/DNP3/ENIP/S7/BACnet/OPC UA/PROFINET traffic, or this Zeek has no ICSNPP packages"
+                : "ICSNPP logs read: " + String.join(", ", rows.keySet()) + " (per package: source.zeek.packages)", rows));
+        return out;
+    }
+
+    /** {@code notes}: things the user should hear on stderr that are not errors (for example the --engine auto fallback). */
+    public record AnalysisResult(AnalysisReport report, IngestModels.Document document, List<String> notes, Late late) {
+        public AnalysisResult(AnalysisReport report, IngestModels.Document document, List<String> notes) {
+            this(report, document, notes, null);
+        }
+
+        public AnalysisResult(AnalysisReport report, IngestModels.Document document) {
+            this(report, document, List.of(), null);
+        }
+    }
+
+    /**
+     * A tool that was still running when the analysis ended ({@link #deferLate}): {@code outcome} completes when it does, and
+     * {@code apply} then adds its findings to the result's document (the same object) and returns it. The caller runs {@code apply}
+     * itself, after it has finished reading the document, so nothing changes under it.
+     */
+    public record Late(CompletableFuture<com.pcap.tools.ToolPipeline.Outcome> outcome,
+                       java.util.function.Function<com.pcap.tools.ToolPipeline.Outcome, IngestModels.Document> apply) {
+    }
+}

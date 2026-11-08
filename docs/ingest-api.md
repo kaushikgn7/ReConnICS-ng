@@ -1,0 +1,130 @@
+# Ingest API: contract for the PCAP project
+
+The PCAP side (passive discovery for Modbus/TCP, S7comm, and EtherNet/IP) sends the assets it observed to the
+advisory matcher. Both run on the same analyst laptop. The API listens on **127.0.0.1 only** and nothing leaves the machine.
+
+> This file is the authoritative output contract for **reconnics-ng**. Copied from the advisory-matcher project
+> (`feat/add-cve-management`) so the PCAP tool can validate offline.
+
+Start it with:
+
+```
+java -jar target/reconnics-ng.jar serve --index data/index.json --pubkey keys/index-signing.pub --port 8088
+```
+
+There's also a file mode with no server, for batch use or CI:
+
+```
+java -jar target/reconnics-ng.jar match --index data/index.json --pubkey keys/index-signing.pub --format json|csv|html ASSETS.json
+```
+
+The file uses the same payload as `POST /api/v1/assets`.
+
+## Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/assets` | Upsert observed assets, keyed by `id`. Re-posting the same id replaces it. With the UI (`serve`), the accepted assets are also added to the site inventory as one finished "posted via API" queue entry (not re-analyzed; an identical payload is not added twice). |
+| `GET` | `/api/v1/assets` | Return the assets exactly as they were posted. |
+| `DELETE` | `/api/v1/assets` | Clear all assets, for example between captures. |
+| `GET` | `/api/v1/matches[?format=csv\|html]` | Advisory matches for every asset. JSON by default. One request at a time; a concurrent one gets `503`. |
+| `GET` | `/api/v1/index` | Index metadata (`generated`, `kevCatalogVersion`, `advisories`, `rows`), useful for staleness checks. Under `serve` it also has `verified` and `warning` (stale index). |
+
+### Site console routes
+
+`serve` also keeps site state under `--data` (default `data/site`) and serves the web UI at `/`. These routes back it.
+Writes take `X-Actor` (name for the change log) and, for `validated`, `X-Role: validator`. Every write needs
+`application/json` or `application/octet-stream` (or a non-simple method), so another web page cannot send one
+without a CORS preflight, which the server never answers.
+
+By default no route sends any CORS header. `serve --allow-origin ORIGIN[,ORIGIN...]` (repeatable) lets one other local
+web page read the console, e.g. `--allow-origin http://localhost:8123` for the lab's 3D viewer: a request whose `Origin` is
+exactly one of those gets `Access-Control-Allow-Origin: <that origin>` (plus `Vary: Origin`) on `GET /api/v1/inventory`,
+`/api/v1/changes` and `/api/v1/captures` only. Matching is exact (scheme, host and port; no wildcard, `*` is refused) and
+read-only on purpose: writes never get the header, preflights stay unanswered and no credentials header is sent, so an
+allowed page can look but not change anything.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/captures?name=FILE` | Queue a capture (`application/octet-stream` body, up to 4 GiB). `202` with the queue entry; `409` for a file already queued (same SHA-256). |
+| `GET` | `/api/v1/captures` | Queue in order: `state` `queued`/`running`/`done`/`failed`, `summary` (frames, protocols, identity fields), `diff` (`new`, `changed`, `notSeen`), `exit`/`error` when failed, and `progress` (`step` of the 7 named `steps`, `stepAt`, and the analysis `log`, at most 300 lines; `step` 8 = merged; kept after the run). `startedAt` / `finishedAt` time the run. `partial: true` means the capture is merged and usable but Suricata was still running; its alerts are added to the capture's flows and hosts when it ends (`lateFinishedAt`, and `summary.tools` shows Suricata as `running`, then `ran` or `failed`). A restart while it runs turns it into `failed` ("interrupted by a restart"). |
+| `DELETE` | `/api/v1/captures/{id}` | Remove a queued or failed capture (204), or a merged one (200, JSON `assetsDropped`, `assetsKeptSeenElsewhere`, `assetsKeptWithEdits`): the inventory is rebuilt without it, so assets another capture also saw stay, assets only it saw go unless a person edited them, and the PCAP and its analysis are deleted. Logged in the change log. |
+| `GET` | `/api/v1/inventory` | `{inventory, rank, site, flows, captureAssets}`: the [`inventory.json`](inventory.md) document for all merged captures plus human edits, record ids in fix-first order, site fields per id, the observed conversations (`flows`, see [`data-contract.md`](data-contract.md#flows)) summed over the merged captures, and the merged capture id → asset ids each capture contributed. Flows carry a `captures` array with the ids that reported them. |
+| `PATCH` | `/api/v1/assets/{id}` | Set `criticality` (`critical`/`high`/`medium`/`low`), `asset_number`, `location`, `logging`, `user_accounts` (comma-separated), `zone`, `owner`, `lifecycle`, `purdue` (`0`-`3.5`), `validated` (boolean, validator only). `""` clears. Returns the change-log entries written. |
+| `GET` | `/api/v1/changes` | Change log, newest first (captures merged, edits, index swaps). |
+| `GET` | `/api/v1/engines` | The open-source components this machine has: `[{id, name, url, licence, kind, optional, role, status: {state, via, version, detail}}]`. Detection starts a few processes, so the answer is cached for 20 s. Capture entries carry the same per-capture states in `summary.tools`. See [`foss-components.md`](foss-components.md). |
+| `POST` | `/api/v1/index[?dry=1]` | New index as the body, signature in `X-Index-Signature`. Verified against `--pubkey` first (`403` if it fails); `dry=1` only reports its metadata, otherwise it replaces the served index and re-matches. |
+| `GET` | `/api/v1/export/{inventory.json,inventory.csv,report.html}` | The inventory outputs for the current site. |
+
+## `POST /api/v1/assets`
+
+- `Content-Type: application/json` is required, otherwise the server returns `415`.
+- The body is limited to 16 MiB, otherwise `413`.
+- Malformed JSON returns `400`.
+- The body is either a bare array of assets or `{"source": {...}, "assets": [...]}`. `source` is free-form; put the tool version and the PCAP hash there.
+
+Full example: [`examples/assets.json`](examples/assets.json).
+
+```json
+{
+  "source": {"tool": "reconics-pcap", "version": "0.1", "pcap": "run1.pcap", "pcapSha256": "..."},
+  "assets": [
+    {
+      "id": "10.10.1.31",
+      "ip": "10.10.1.31",
+      "mac": "00:20:4a:00:00:01",
+      "protocols": ["modbus"],
+      "vendor":   {"value": "Lantronix", "confidence": "HIGH", "evidence": "Modbus FC43/14 VendorName, frame 412"},
+      "model":    {"value": "EDS5000",   "confidence": "HIGH", "evidence": "Modbus FC43/14 ProductCode"},
+      "firmware": {"value": "2.0.0.0R1", "confidence": "HIGH", "evidence": "Modbus FC43/14 MajorMinorRevision"},
+      "attributes": {"...": "remaining CISA attributes, passed through untouched"}
+    }
+  ]
+}
+```
+
+### Fields
+
+| Field | Required | Used for matching | Notes |
+|---|---|---|---|
+| `id` | one of `id`/`ip`/`mac` | — | Defaults to `ip`, then `mac`. At most 128 characters. |
+| `ip`, `mac` | | — | Strings. |
+| `vendor` | no | yes | Without a vendor the asset is always `NONE`. |
+| `model` | no | yes | Product or model name as the device reports it. |
+| `firmware` | no | yes | Version string as the device reports it. A leading `V`/`v` is fine. |
+| anything else | no | no | Stored and echoed back verbatim. The 14 CISA attributes, `protocols`, and similar fields go here. |
+
+`vendor`, `model`, and `firmware` each accept either a plain string or
+`{"value": "...", "confidence": "HIGH|MEDIUM|LOW", "evidence": "..."}`. Only `value` is used for matching, and the rest is
+echoed back. **Prefer the object form.** The proposal requires every filled field to carry evidence and a confidence level.
+
+### Response
+
+- `200 {"accepted": N, "rejected": []}` when every asset is valid.
+- `207 {"accepted": N, "rejected": [{"index": 3, "reason": "vendor must be a string"}]}` when some assets are invalid. The valid ones are stored anyway.
+
+## Match levels
+
+| Level | Condition |
+|---|---|
+| `EXACT` | Vendor, model, and firmware all match. The firmware falls inside the advisory's affected version or `vers:` range. |
+| `PROBABLE` | Vendor and model match, but the firmware is unknown or the advisory lists no parseable version; or the advisory names only the product line the model belongs to (`ControlLogix` for a 1756-L61). |
+| `POSSIBLE` | Only the vendor is known. The asset has no model, and every advisory for that vendor is returned. |
+| `NONE` | No vendor, a known model that appears in no advisory, or a firmware version outside every affected range. |
+
+Vendor and model names are compared as token sets, ignoring case, punctuation, and corporate suffixes. A name matches when one
+token set contains the other, so `Schneider` ≈ `Schneider Electric` and `EasyIO FG` ≈ `EasyIO FG firmware`.
+**The more exact the strings you send, the better the match.** If the device reports a numeric vendor ID (CIP, Modbus), resolve it to the
+vendor *name* on the PCAP side.
+
+## What the PCAP side needs to provide
+
+1. One asset per device, with a stable `id`. IP is fine for a single capture.
+2. `vendor`, `model`, and `firmware` taken from protocol identity responses seen passively:
+   - Modbus FC 43/14 (Read Device Identification): VendorName, ProductCode, MajorMinorRevision.
+   - EtherNet/IP ListIdentity / CIP Identity object: vendor ID → name, product name, revision.
+   - S7comm SZL reads (module identification) observed in captured engineering traffic.
+
+   If you use ICSNPP Zeek parsers, these values come from their identity logs. Check the exact log and field names against the parser version you pin.
+3. An `evidence` value pointing back to the frame or log line, plus a `confidence`.
+4. Nothing active. The matcher never contacts devices, and the PCAP side mustn't either.

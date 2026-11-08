@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ReConnICS-ng console</title>
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header id="top">
+  <button class="mobile-menu" id="mobile-menu" type="button" aria-label="Open site navigation" aria-expanded="false" aria-controls="tree">☰</button>
+  <a class="brand" href="#/graph" aria-label="ReConnICS home">ReConnICS</a>
+  <nav id="modes" aria-label="Console mode">
+    <a href="#/graph" data-mode="graph">Graph</a>
+    <a href="#/inventory" data-mode="inventory">Inventory</a>
+    <a href="#/findings" data-mode="findings">Findings <span id="mode-findings-pills"></span></a>
+  </nav>
+  <div id="top-search" role="search">
+    <label class="sr" for="q">Search hosts and conversations</label>
+    <input id="q" type="search" placeholder="Search hosts, or level:exact proto:modbus kev" autocomplete="off">
+    <div id="search-hints" aria-label="Search suggestions">
+      <button type="button" data-query="level:exact">level:exact</button><button type="button" data-query="proto:modbus">proto:modbus</button>
+      <button type="button" data-query="role:plc">role:plc</button><button type="button" data-query="kev">kev</button>
+      <button type="button" data-query="unvalidated">unvalidated</button>
+    </div>
+  </div>
+  <span class="top-spacer"></span>
+  <a class="badge" id="idx-badge" href="#/index">Index</a>
+  <span class="badge local-pill">127.0.0.1 only</span>
+  <button class="btn pri" id="top-upload" type="button">Upload PCAP</button>
+</header>
+
+<div id="workspace">
+<aside id="tree" aria-label="Site navigation">
+  <div class="tree-heading">CAPTURES</div>
+  <a class="tree-row" href="#/captures"><span class="tree-icon">▤</span><span>Captures</span><span class="tree-count" id="tree-capture-count"></span></a>
+  <div class="tree-heading">ASSETS</div>
+  <a class="tree-row" href="#/graph" data-level="4"><span class="tree-icon">◉</span><span>Level 4 · External</span></a>
+  <a class="tree-row" href="#/graph" data-level="3"><span class="tree-icon">◉</span><span>Level 3 · Operations</span></a>
+  <a class="tree-row" href="#/graph" data-level="2"><span class="tree-icon">◉</span><span>Level 2 · Supervisory</span></a>
+  <a class="tree-row" href="#/graph" data-level="1"><span class="tree-icon">◉</span><span>Level 1 · Control</span></a>
+  <a class="tree-row" href="#/graph" data-level="0"><span class="tree-icon">◉</span><span>Level 0 · Process</span></a>
+  <div class="tree-heading">FINDINGS</div>
+  <a class="tree-row" href="#/advisories"><span class="tree-icon">△</span><span>Advisories</span><span class="tree-count" id="tree-advisory-count"></span></a>
+  <a class="tree-row" href="#/review"><span class="tree-icon">✓</span><span>Review queue</span><span class="tree-count" id="tree-review-count"></span></a>
+  <div class="tree-heading">SYSTEM</div>
+  <a class="tree-row" href="#/index"><span class="tree-icon">◫</span><span>Advisory index</span></a>
+  <a class="tree-row" href="#/engines"><span class="tree-icon">▦</span><span>Engines</span></a>
+  <a class="tree-row" href="#/log"><span class="tree-icon">◷</span><span>Change log</span></a>
+  <a class="tree-row" href="#/export"><span class="tree-icon">⇩</span><span>Export</span></a>
+  <a class="tree-row" href="#/settings"><span class="tree-icon">⚙</span><span>Settings</span></a>
+</aside>
+<div id="stage">
+  <svg id="graph" tabindex="0" role="group" aria-label="Asset conversation graph. Each asset is a focusable node; Enter opens its details. Plus and minus zoom, zero fits the graph."></svg>
+  <div id="floats"></div>
+  <div id="graph-chips" aria-label="Protocol filters"></div>
+  <div id="graph-layout" aria-label="Graph display options"></div>
+  <div id="graph-empty" role="status" aria-live="polite" hidden><span id="graph-empty-text"></span><button class="btn sm" id="graph-reset" type="button">Reset filters</button></div>
+  <section class="panel search" aria-label="Pathfinding">
+  <div class="row-s">
+    <input id="start" list="asset-list" placeholder="Start Node" aria-label="Start node: IP, name, vendor or model" autocomplete="off">
+    <button class="ib" id="btn-route" aria-label="Click two graph assets to find their shortest path" title="Click two graph assets to find their shortest path" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="18" r="2"/><circle cx="18" cy="6" r="2"/><path d="M8 18h6a3 3 0 0 0 0-6h-4a3 3 0 0 1 0-6h6"/></svg></button>
+    <button class="ib" id="btn-back" aria-label="Back: clear selection and path" title="Back"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 5l-9 7 9 7zM6 5v14"/></svg></button>
+    <button class="ib" id="btn-filter" aria-label="Filters and display options" title="Filter" aria-expanded="false" aria-controls="pop-filter"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16l-6 8v6l-4-2v-4z"/></svg></button>
+  </div>
+  <div class="row-s" id="row-target">
+    <span class="ib ghost" aria-hidden="true"></span>
+    <input id="target" list="asset-list" placeholder="Target Node" aria-label="Target node: IP, name, vendor or model" autocomplete="off">
+    <button class="ib" id="btn-go" aria-label="Show the shortest conversation path from start to target" title="Find path"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l11 7-11 7z"/></svg></button>
+  </div>
+  <div id="pop-filter" class="pop" hidden></div>
+</section>
+  <div class="toolbar" role="toolbar" aria-label="Graph tools" aria-orientation="vertical">
+  <button class="ib" id="tb-reset" aria-label="Reset filters" title="Reset filters"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16l-6 8v6l-4-2v-4zM16 15l5 5M21 15l-5 5"/></svg></button>
+  <button class="ib" id="tb-layout" aria-label="Re-run the graph layout and fit it to the window" title="Layout"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="8" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M8 7l8 1M7 8l4 8M17 10l-4 6"/></svg></button>
+  <button class="ib" id="z-in" aria-label="Zoom in" title="Zoom in"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>
+  <button class="ib" id="z-fit" aria-label="Fit graph to window" title="Fit"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11l8-7 8 7M6 10v10h12V10"/></svg></button>
+  <button class="ib" id="z-out" aria-label="Zoom out" title="Zoom out"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg></button>
+  <button class="ib" id="tb-info" aria-label="Legend and index status" title="Info" aria-expanded="false" aria-controls="pop-info"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5h.01"/></svg></button>
+  </div>
+</div>
+<datalist id="asset-list"></datalist>
+<div id="banner"></div>
+<div id="load-error" role="alert" aria-live="assertive" hidden><div class="strong">Console data could not be loaded</div><div id="load-error-text"></div><button class="btn pri" id="retry-load" type="button">Retry</button></div>
+
+<input type="file" id="import-pick" class="sr" multiple accept=".pcap,.pcapng,.cap" tabindex="-1" aria-hidden="true">
+<div id="pop-info" class="pop side-pop" hidden></div>
+
+
+<div id="split" role="separator" aria-orientation="vertical" aria-label="Resize the side panel (arrow keys or drag)" tabindex="0" hidden></div>
+<main id="main" class="sheet" tabindex="-1" hidden></main>
+<div id="toast" role="status" aria-live="polite"></div>
+</div>
+</body>
+</html>

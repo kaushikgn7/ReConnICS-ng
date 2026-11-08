@@ -1,0 +1,361 @@
+package com.pcap.capture;
+
+import com.pcap.util.IpAddress;
+import com.pcap.util.MacAddress;
+
+import java.util.Optional;
+
+public final class ParsedPacket {
+    private final long frameNumber;
+    private final long timestampMicros;
+    private final MacAddress srcMac;
+    private final MacAddress dstMac;
+    private final int vlanId;
+    private final int etherType;
+    private final IpAddress srcIp;
+    private final IpAddress dstIp;
+    private final int ipProtocol;
+    private final boolean ipv4Fragment;
+    private final int srcPort;
+    private final int dstPort;
+    private final byte[] payload;
+    private final int payloadOffset;
+    private final int payloadLength;
+    private final ParseStatus status;
+    private final String detail;
+    private final long tcpSeq;
+    private final int tcpFlags;
+    private final boolean arp;
+    private final int arpOp, icmpType, icmpCode, icmpId, icmpSeq, wireLength;
+    private final String icmpAbout;
+
+    private ParsedPacket(Builder b) {
+        this.frameNumber = b.frameNumber;
+        this.timestampMicros = b.timestampMicros;
+        this.srcMac = b.srcMac;
+        this.dstMac = b.dstMac;
+        this.vlanId = b.vlanId;
+        this.etherType = b.etherType;
+        this.srcIp = b.srcIp;
+        this.dstIp = b.dstIp;
+        this.ipProtocol = b.ipProtocol;
+        this.ipv4Fragment = b.ipv4Fragment;
+        this.srcPort = b.srcPort;
+        this.dstPort = b.dstPort;
+        this.payload = b.payload;
+        this.payloadOffset = b.payloadOffset;
+        this.payloadLength = b.payloadLength;
+        this.status = b.status;
+        this.detail = b.detail;
+        this.tcpSeq = b.tcpSeq;
+        this.tcpFlags = b.tcpFlags;
+        this.arp = b.arp;
+        this.arpOp = b.arpOp;
+        this.icmpType = b.icmpType;
+        this.icmpCode = b.icmpCode;
+        this.icmpId = b.icmpId;
+        this.icmpSeq = b.icmpSeq;
+        this.icmpAbout = b.icmpAbout;
+        this.wireLength = b.wireLength;
+    }
+
+    /** ARP request/reply: srcMac/srcIp are the ARP sender hardware/protocol addresses. */
+    public boolean isArp() {
+        return arp;
+    }
+
+    /** ARP operation (1 request, 2 reply), or -1. */
+    public int arpOp() {
+        return arpOp;
+    }
+
+    /** ICMP type and code of an IPv4 ICMP message (first two bytes of the IP payload), or -1. */
+    public int icmpType() {
+        return icmpType;
+    }
+
+    public int icmpCode() {
+        return icmpCode;
+    }
+
+    /** Identifier and sequence number of an echo request/reply, or -1. */
+    public int icmpId() {
+        return icmpId;
+    }
+
+    public int icmpSeq() {
+        return icmpSeq;
+    }
+
+    /** Destination ({@code ip}, or {@code ip:port/tcp|udp}) of the packet an ICMP error quotes, or null. */
+    public String icmpAbout() {
+        return icmpAbout;
+    }
+
+    /** Bytes of the frame as captured. */
+    public int wireLength() {
+        return wireLength;
+    }
+
+    public static final int TCP_FIN = 0x01;
+    public static final int TCP_SYN = 0x02;
+    public static final int TCP_RST = 0x04;
+    public static final int TCP_ACK = 0x10;
+
+    /** TCP sequence number (unsigned 32-bit), or -1 when not TCP. */
+    public long tcpSeq() {
+        return tcpSeq;
+    }
+
+    public int tcpFlags() {
+        return tcpFlags;
+    }
+
+    /**
+     * Copy of this packet's headers carrying a different (reassembled) payload, attributed to {@code frame}.
+     */
+    public ParsedPacket withPayload(long frame, byte[] data, int offset, int length) {
+        Builder b = new Builder(frame, timestampMicros);
+        b.srcMac = srcMac;
+        b.dstMac = dstMac;
+        b.vlanId = vlanId;
+        b.etherType = etherType;
+        b.srcIp = srcIp;
+        b.dstIp = dstIp;
+        b.ipProtocol = ipProtocol;
+        b.ipv4Fragment = ipv4Fragment;
+        b.srcPort = srcPort;
+        b.dstPort = dstPort;
+        b.tcpSeq = tcpSeq;
+        b.tcpFlags = tcpFlags;
+        b.arp = arp;
+        b.arpOp = arpOp;
+        b.icmpType = icmpType;
+        b.icmpCode = icmpCode;
+        b.icmpId = icmpId;
+        b.icmpSeq = icmpSeq;
+        b.icmpAbout = icmpAbout;
+        b.wireLength = wireLength;
+        return b.payload(data, offset, length).status(status, detail).build();
+    }
+
+    public long frameNumber() {
+        return frameNumber;
+    }
+
+    public long timestampMicros() {
+        return timestampMicros;
+    }
+
+    public Optional<MacAddress> srcMac() {
+        return Optional.ofNullable(srcMac);
+    }
+
+    public Optional<MacAddress> dstMac() {
+        return Optional.ofNullable(dstMac);
+    }
+
+    public int vlanId() {
+        return vlanId;
+    }
+
+    public int etherType() {
+        return etherType;
+    }
+
+    public Optional<IpAddress> srcIp() {
+        return Optional.ofNullable(srcIp);
+    }
+
+    public Optional<IpAddress> dstIp() {
+        return Optional.ofNullable(dstIp);
+    }
+
+    public int ipProtocol() {
+        return ipProtocol;
+    }
+
+    public boolean ipv4Fragment() {
+        return ipv4Fragment;
+    }
+
+    public int srcPort() {
+        return srcPort;
+    }
+
+    public int dstPort() {
+        return dstPort;
+    }
+
+    public boolean hasTcp() {
+        return ipProtocol == 6 && srcPort >= 0 && dstPort >= 0;
+    }
+
+    public boolean hasUdp() {
+        return ipProtocol == 17 && srcPort >= 0 && dstPort >= 0;
+    }
+
+    public byte[] payload() {
+        return payload;
+    }
+
+    public int payloadOffset() {
+        return payloadOffset;
+    }
+
+    public int payloadLength() {
+        return payloadLength;
+    }
+
+    public ParseStatus status() {
+        return status;
+    }
+
+    public String detail() {
+        return detail;
+    }
+
+    public boolean recoverable() {
+        return status == ParseStatus.OK || status == ParseStatus.FRAGMENTED
+                || status == ParseStatus.UNSUPPORTED || status == ParseStatus.SKIPPED;
+    }
+
+    public static Builder builder(long frameNumber, long timestampMicros) {
+        return new Builder(frameNumber, timestampMicros);
+    }
+
+    public static final class Builder {
+        private final long frameNumber;
+        private final long timestampMicros;
+        private MacAddress srcMac;
+        private MacAddress dstMac;
+        private int vlanId = -1;
+        private int etherType = -1;
+        private IpAddress srcIp;
+        private IpAddress dstIp;
+        private int ipProtocol = -1;
+        private boolean ipv4Fragment;
+        private int srcPort = -1;
+        private int dstPort = -1;
+        private byte[] payload;
+        private int payloadOffset;
+        private int payloadLength;
+        private ParseStatus status = ParseStatus.OK;
+        private String detail = "";
+        private long tcpSeq = -1;
+        private int tcpFlags;
+        private boolean arp;
+        private int arpOp = -1, icmpType = -1, icmpCode = -1, icmpId = -1, icmpSeq = -1, wireLength;
+        private String icmpAbout;
+
+        private Builder(long frameNumber, long timestampMicros) {
+            this.frameNumber = frameNumber;
+            this.timestampMicros = timestampMicros;
+        }
+
+        public Builder srcMac(MacAddress v) {
+            srcMac = v;
+            return this;
+        }
+
+        public Builder dstMac(MacAddress v) {
+            dstMac = v;
+            return this;
+        }
+
+        public Builder vlanId(int v) {
+            vlanId = v;
+            return this;
+        }
+
+        public Builder etherType(int v) {
+            etherType = v;
+            return this;
+        }
+
+        public Builder srcIp(IpAddress v) {
+            srcIp = v;
+            return this;
+        }
+
+        public Builder dstIp(IpAddress v) {
+            dstIp = v;
+            return this;
+        }
+
+        public Builder ipProtocol(int v) {
+            ipProtocol = v;
+            return this;
+        }
+
+        public Builder ipv4Fragment(boolean v) {
+            ipv4Fragment = v;
+            return this;
+        }
+
+        public Builder srcPort(int v) {
+            srcPort = v;
+            return this;
+        }
+
+        public Builder dstPort(int v) {
+            dstPort = v;
+            return this;
+        }
+
+        public Builder arp(boolean v) {
+            arp = v;
+            return this;
+        }
+
+        public Builder arpOp(int v) {
+            arpOp = v;
+            return this;
+        }
+
+        public Builder icmp(int type, int code) {
+            icmpType = type;
+            icmpCode = code;
+            return this;
+        }
+
+        public Builder icmpEcho(int id, int seq) {
+            icmpId = id;
+            icmpSeq = seq;
+            return this;
+        }
+
+        public Builder icmpAbout(String v) {
+            icmpAbout = v;
+            return this;
+        }
+
+        public Builder wireLength(int v) {
+            wireLength = v;
+            return this;
+        }
+
+        public Builder tcp(long seq, int flags) {
+            tcpSeq = seq;
+            tcpFlags = flags;
+            return this;
+        }
+
+        public Builder payload(byte[] data, int offset, int length) {
+            payload = data;
+            payloadOffset = offset;
+            payloadLength = length;
+            return this;
+        }
+
+        public Builder status(ParseStatus s, String detail) {
+            this.status = s;
+            this.detail = detail == null ? "" : detail;
+            return this;
+        }
+
+        public ParsedPacket build() {
+            return new ParsedPacket(this);
+        }
+    }
+}

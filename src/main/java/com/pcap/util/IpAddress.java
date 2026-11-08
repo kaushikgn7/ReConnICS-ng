@@ -1,0 +1,109 @@
+package com.pcap.util;
+
+import java.util.Locale;
+import java.util.Objects;
+
+public final class IpAddress implements Comparable<IpAddress> {
+    private final String value;
+    private final boolean ipv6;
+
+    private IpAddress(String value, boolean ipv6) {
+        this.value = value;
+        this.ipv6 = ipv6;
+    }
+
+    public static IpAddress ipv4(byte[] bytes, int offset) {
+        Objects.requireNonNull(bytes, "bytes");
+        if (offset < 0 || offset + 4 > bytes.length) {
+            throw new IndexOutOfBoundsException("IPv4 requires 4 bytes");
+        }
+        return new IpAddress(String.format(Locale.ROOT, "%d.%d.%d.%d",
+                bytes[offset] & 0xFF, bytes[offset + 1] & 0xFF,
+                bytes[offset + 2] & 0xFF, bytes[offset + 3] & 0xFF), false);
+    }
+
+    public static IpAddress parse(String s) {
+        if (s == null || s.isBlank()) {
+            return null;
+        }
+        String t = s.trim();
+        if (t.contains(":")) {
+            return new IpAddress(t.toLowerCase(Locale.ROOT), true);
+        }
+        String[] parts = t.split("\\.");
+        if (parts.length != 4) {
+            throw new IllegalArgumentException("invalid IPv4: " + s);
+        }
+        byte[] b = new byte[4];
+        for (int i = 0; i < 4; i++) {
+            int v = Integer.parseInt(parts[i]);
+            if (v < 0 || v > 255) {
+                throw new IllegalArgumentException("invalid IPv4: " + s);
+            }
+            b[i] = (byte) v;
+        }
+        return ipv4(b, 0);
+    }
+
+    /** True for a usable host address: not 0.0.0.0, not 255.255.255.255, not multicast (224/4), not IPv6. */
+    public boolean isUnicastHost() {
+        if (ipv6) {
+            return false;
+        }
+        int dot = value.indexOf('.');
+        int first = Integer.parseInt(value.substring(0, dot));
+        return !value.equals("0.0.0.0") && !value.equals("255.255.255.255") && first < 224 && first != 0;
+    }
+
+    /** 255.255.255.255, the limited broadcast. */
+    public boolean isLimitedBroadcast() {
+        return !ipv6 && value.equals("255.255.255.255");
+    }
+
+    /** 224.0.0.0/4. */
+    public boolean isMulticast() {
+        if (ipv6) {
+            return false;
+        }
+        int first = Integer.parseInt(value.substring(0, value.indexOf('.')));
+        return first >= 224 && first < 240;
+    }
+
+    /** 0.0.0.0: the "this host" source of a DHCP discover or an ARP probe. */
+    public boolean isUnspecified() {
+        return !ipv6 && value.equals("0.0.0.0");
+    }
+
+    /** {@code broadcast}, {@code multicast} or null: an address several hosts listen on, never one host. */
+    public String groupKind() {
+        return isLimitedBroadcast() ? "broadcast" : isMulticast() ? "multicast" : null;
+    }
+
+    public String value() {
+        return value;
+    }
+
+    public boolean isIpv6() {
+        return ipv6;
+    }
+
+    @Override
+    public String toString() {
+        return value;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        return o instanceof IpAddress ip && value.equals(ip.value);
+    }
+
+    @Override
+    public int hashCode() {
+        return value.hashCode();
+    }
+
+    @Override
+    public int compareTo(IpAddress o) {
+        return value.compareTo(o.value);
+    }
+}
